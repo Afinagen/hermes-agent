@@ -186,3 +186,72 @@ def test_self_suspend_available_needs_identity_and_socket():
         assert self_suspend_available(_FLY_ENV) is False
     # Missing identity -> unavailable regardless of socket.
     assert self_suspend_available({}) is False
+
+# Brokered suspend: Azure's stop verb needs a credential the sandbox lacks, so
+# NAS stamps a signed sleep URL and stops the machine on our POST.
+
+from gateway.scale_to_zero import (  # noqa: E402 - grouped with their section
+    SLEEP_URL_ENV,
+    brokered_sleep_url,
+    request_brokered_suspend,
+    suspend_available,
+)
+
+_SLEEP_URL = "https://portal.example.com/api/agents/inst-1/sleep?t=sig"
+
+
+def test_brokered_sleep_url_reads_the_stamp():
+    assert brokered_sleep_url({SLEEP_URL_ENV: _SLEEP_URL}) == _SLEEP_URL
+    assert brokered_sleep_url({}) is None
+    assert brokered_sleep_url({SLEEP_URL_ENV: "   "}) is None
+
+
+def test_suspend_available_accepts_either_lever(monkeypatch):
+    # No flaps socket but a broker exists, so the watcher may still quiesce.
+    monkeypatch.setattr(
+        "gateway.scale_to_zero.self_suspend_available", lambda *a, **k: False
+    )
+    assert suspend_available({SLEEP_URL_ENV: _SLEEP_URL}) is True
+    assert suspend_available({}) is False
+    monkeypatch.setattr(
+        "gateway.scale_to_zero.self_suspend_available", lambda *a, **k: True
+    )
+    assert suspend_available({}) is True
+
+
+class _FakeResponse:
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_request_brokered_suspend_posts_the_signed_url():
+    seen = {}
+
+    def opener(request, timeout=None):
+        seen["url"] = request.full_url
+        seen["method"] = request.get_method()
+        return _FakeResponse(200)
+
+    assert request_brokered_suspend(_SLEEP_URL, opener=opener) is True
+    assert seen == {"url": _SLEEP_URL, "method": "POST"}
+
+
+def test_request_brokered_suspend_fails_awake():
+    # Fail-awake: any refusal leaves the machine running rather than stranding a
+    # frozen peer that still looks live to the connector.
+    import urllib.error
+
+    def http_error(request, timeout=None):
+        raise urllib.error.HTTPError(_SLEEP_URL, 409, "Conflict", {}, None)
+
+    def unreachable(request, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    for opener in (http_error, unreachable, lambda *a, **k: _FakeResponse(500)):
+        assert request_brokered_suspend(_SLEEP_URL, opener=opener) is False

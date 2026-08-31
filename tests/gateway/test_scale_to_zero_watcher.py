@@ -21,10 +21,17 @@ from gateway.run import GatewayRunner
 class _FakeRelayAdapter:
     def __init__(self):
         self.go_dormant_calls = 0
+        self.redial = []
 
     async def go_dormant(self):
         self.go_dormant_calls += 1
         return True
+
+    def hold_redial(self):
+        self.redial.append("hold")
+
+    def release_redial(self):
+        self.redial.append("release")
 
 
 def _runner_with(monkeypatch, *, idle, armed_adapter=True, can_self_suspend=True):
@@ -58,13 +65,11 @@ def _runner_with(monkeypatch, *, idle, armed_adapter=True, can_self_suspend=True
 
 
 @pytest.mark.asyncio
-async def test_watcher_does_not_quiesce_when_the_platform_owns_the_suspend(
+async def test_watcher_does_not_quiesce_when_no_suspend_lever_exists(
     monkeypatch,
 ):
-    """Quiescing cannot help when the platform owns the freeze, and the reconnect
-    that follows the socket close undoes the flip, so the destination ends up
-    unflipped when the freeze lands.
-    """
+    """With no lever at all, the re-dial after the socket close just undoes the
+    flip, so quiescing cannot help. Stay connected instead."""
     r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
     suspends = []
     monkeypatch.setattr(
@@ -85,6 +90,66 @@ async def test_watcher_does_not_quiesce_when_the_platform_owns_the_suspend(
     # the moment the platform picture changes.
     assert r._scale_to_zero_cooldown_until == 0.0
     assert r._scale_to_zero_no_suspend_logged is True
+
+
+@pytest.mark.asyncio
+async def test_watcher_quiesces_and_suspends_through_the_broker(monkeypatch):
+    """The Azure path: no flaps socket, but a stamped sleep URL means a suspend
+    can follow the quiesce, so the watcher must drive it."""
+    monkeypatch.setenv(
+        "GATEWAY_RELAY_SLEEP_URL",
+        "https://portal.example.com/api/agents/inst-1/sleep?t=sig",
+    )
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
+    suspends = []
+
+    async def fake_suspend():
+        suspends.append(1)
+
+    monkeypatch.setattr(r, "_scale_to_zero_self_suspend", fake_suspend, raising=False)
+
+    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
+    await asyncio.sleep(0.15)
+    r._running = False
+    await asyncio.wait_for(task, timeout=2)
+
+    # Flip first, freeze second — the ordering the whole feature rests on.
+    assert adapter.go_dormant_calls == 1
+    assert suspends == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "in_guest,accepted,lever,redial",
+    [
+        (True, True, "flaps", []),
+        (False, True, "brokered", ["hold"]),
+        (False, False, "brokered", ["hold", "release"]),
+    ],
+)
+async def test_self_suspend_picks_a_lever_and_parks_only_the_broker(
+    monkeypatch, in_guest, accepted, lever, redial
+):
+    # Fly is never parked: its suspend preserves RAM, so a hold left set would
+    # survive the resume and delay the re-dial the wake poke wants.
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=in_guest)
+    monkeypatch.setenv(
+        "GATEWAY_RELAY_SLEEP_URL", "https://portal.example.com/api/agents/i/sleep?t=s"
+    )
+    used = []
+    monkeypatch.setattr(
+        "gateway.scale_to_zero.suspend_self",
+        lambda *a, **k: used.append("flaps") or accepted,
+    )
+    monkeypatch.setattr(
+        "gateway.scale_to_zero.request_brokered_suspend",
+        lambda *a, **k: used.append("brokered") or accepted,
+    )
+
+    await r._scale_to_zero_self_suspend()
+
+    assert used == [lever]
+    assert adapter.redial == redial
 
 
 @pytest.mark.asyncio
@@ -275,10 +340,11 @@ async def test_watcher_skips_suspend_when_inbound_lands_mid_quiesce(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_self_suspend_noop_off_fly(monkeypatch):
-    """Off-Fly (no flaps socket/identity) the helper is a silent no-op —
-    dormancy without platform suspend, never an error."""
+async def test_self_suspend_noop_with_no_lever(monkeypatch):
+    """Neither an in-guest API nor a brokered URL: a silent no-op — dormancy
+    without platform suspend, never an error."""
     r = GatewayRunner.__new__(GatewayRunner)
+    monkeypatch.delenv("GATEWAY_RELAY_SLEEP_URL", raising=False)
     monkeypatch.setattr(
         "gateway.scale_to_zero.self_suspend_available", lambda *a, **k: False
     )

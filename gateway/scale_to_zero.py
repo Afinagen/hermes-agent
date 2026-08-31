@@ -61,6 +61,10 @@ FLY_MACHINE_ID_ENV = "FLY_MACHINE_ID"
 # the app must own the idle decision (https://fly.io/docs/reference/suspend-resume/).
 FLY_API_SOCKET = "/.fly/api"
 
+# NAS-brokered suspend, stamped where the guest cannot suspend itself. Carries
+# its own signed credential in the query string, like GATEWAY_RELAY_WAKE_URL.
+SLEEP_URL_ENV = "GATEWAY_RELAY_SLEEP_URL"
+
 
 # config.yaml default (D2). Behavioural setting -> config, not env.
 # 2 minutes: with the gateway owning the suspend (idle predicate covers agent
@@ -168,9 +172,8 @@ def self_suspend_available(environ: Optional[dict] = None) -> bool:
     """Whether this process can suspend its own machine via the flaps socket.
 
     True iff the Fly-injected machine identity is present AND the local Machines
-    API socket exists. Off-Fly (local dev, Azure ACA, tests) this is False and
-    the watcher skips the quiesce entirely: the platform owns the freeze, so
-    the gateway stays connected until it lands.
+    API socket exists. Off-Fly this is False; see ``suspend_available`` for
+    whether some OTHER lever exists before concluding the watcher must abstain.
     """
     env = environ if environ is not None else os.environ
     return bool(
@@ -178,6 +181,60 @@ def self_suspend_available(environ: Optional[dict] = None) -> bool:
         and str(env.get(FLY_MACHINE_ID_ENV, "")).strip()
         and os.path.exists(FLY_API_SOCKET)
     )
+
+
+def brokered_sleep_url(environ: Optional[dict] = None) -> Optional[str]:
+    """The NAS sleep endpoint to POST, or None when this backend has no broker."""
+    env = environ if environ is not None else os.environ
+    url = str(env.get(SLEEP_URL_ENV, "")).strip()
+    return url or None
+
+
+def suspend_available(environ: Optional[dict] = None) -> bool:
+    """Whether ANY suspend lever exists, in-guest or brokered.
+
+    Quiescing without one is worse than not quiescing: the re-dial clears the flip.
+    """
+    env = environ if environ is not None else os.environ
+    return self_suspend_available(env) or brokered_sleep_url(env) is not None
+
+
+def request_brokered_suspend(
+    url: str,
+    *,
+    timeout: float = 10.0,
+    opener: Any = None,
+) -> bool:
+    """POST the NAS sleep URL so NAS stops this machine on our behalf.
+
+    Same contract as ``suspend_self``: never raises, True only on 2xx, fail-awake.
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(url, data=b"", method="POST")
+    request.add_header("Content-Length", "0")
+    open_url = opener or urllib.request.urlopen
+    try:
+        with open_url(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", 0) or 0)
+    except urllib.error.HTTPError as exc:
+        # Not retried here: the watcher re-runs on its own interval.
+        logger.warning(
+            "scale-to-zero: brokered suspend rejected: %s %s",
+            exc.code,
+            exc.reason,
+        )
+        return False
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        logger.warning("scale-to-zero: brokered suspend request failed: %s", exc)
+        return False
+    ok = 200 <= status < 300
+    if ok:
+        logger.info("scale-to-zero: machine suspend accepted by NAS (%s)", status)
+    else:
+        logger.warning("scale-to-zero: brokered suspend returned %s", status)
+    return ok
 
 
 def suspend_self(

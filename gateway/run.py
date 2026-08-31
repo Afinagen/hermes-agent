@@ -9490,9 +9490,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         wakes the machine, the preserved reconnect supervisor re-dials, and the
         connector drains the buffered backlog. After driving dormant we set a
         re-arm cooldown so a wake's drained backlog isn't immediately re-quiesced.
-        Off-Fly (no flaps socket / machine identity) the watcher does not quiesce
-        at all: the platform suspends on its own timer, so the gateway stays
-        connected and serving until the freeze lands.
+        Without a flaps socket, NAS brokers the stop through the stamped
+        GATEWAY_RELAY_SLEEP_URL. With no lever at all the watcher abstains.
         """
         await asyncio.sleep(min(interval, 30.0))  # let startup settle
         while self._running:
@@ -9510,23 +9509,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 go_dormant = getattr(adapter, "go_dormant", None)
                 if not callable(go_dormant):
                     continue
-                # Quiesce only when a suspend can follow it. Off-Fly the platform
-                # owns the freeze on its own timer, so this does not bring it any
-                # closer, and go_dormant()'s socket close arms the reconnect
-                # supervisor: it re-dials ~1.4s later and the drain clears the
-                # flip, every cooldown. The destination is then unflipped when the
-                # freeze lands, and inbound is dropped instead of buffered. Stay
-                # connected and let the connector's orphan detection adopt the
-                # destination once the platform freezes us.
-                from gateway.scale_to_zero import self_suspend_available
+                # Quiesce only when a suspend can follow it: otherwise the
+                # re-dial after the socket close just clears the flip again.
+                from gateway.scale_to_zero import suspend_available
 
-                if not self_suspend_available():
+                if not suspend_available():
                     if not self._scale_to_zero_no_suspend_logged:
                         self._scale_to_zero_no_suspend_logged = True
                         logger.info(
-                            "scale-to-zero: idle, but this platform suspends on "
-                            "its own timer (no in-machine suspend API); staying "
-                            "connected rather than quiescing"
+                            "scale-to-zero: idle, but this platform offers no "
+                            "suspend lever (no in-machine API and no brokered "
+                            "sleep URL); staying connected rather than quiescing"
                         )
                     continue
                 logger.info(
@@ -9568,30 +9561,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("scale-to-zero watcher iteration error", exc_info=True)
 
     async def _scale_to_zero_self_suspend(self) -> None:
-        """Suspend this Fly machine via the local flaps socket (fail-awake).
+        """Suspend this machine, in-guest where possible and via NAS otherwise.
 
-        Runs the blocking unix-socket call in a worker thread so the event loop
-        stays live right up to the kernel freeze. On success the process is
-        frozen shortly after — nothing meaningful runs until the wake resume.
-        Off-Fly (self_suspend_available() False) this is a silent no-op.
+        Fail-awake, and called ONLY after a clean go_dormant().
         """
-        from gateway.scale_to_zero import self_suspend_available, suspend_self
+        from gateway.scale_to_zero import (
+            brokered_sleep_url,
+            request_brokered_suspend,
+            self_suspend_available,
+            suspend_self,
+        )
 
         try:
-            if not self_suspend_available():
-                logger.debug(
-                    "scale-to-zero: flaps socket / machine identity absent — "
-                    "dormant without platform suspend"
-                )
-                return
-            accepted = await asyncio.to_thread(suspend_self)
+            if self_suspend_available():
+                accepted = await asyncio.to_thread(suspend_self)
+                lever = "self-suspend"
+            else:
+                # No in-guest API (Azure ACA): NAS holds the credential for the
+                # stop verb and brokers it for us.
+                url = brokered_sleep_url()
+                if not url:
+                    logger.debug(
+                        "scale-to-zero: no suspend lever available — dormant "
+                        "without platform suspend"
+                    )
+                    return
+                # Park the supervisor: a re-dial would clear the dormant flip
+                # before the stop lands. Set before the first await.
+                self._scale_to_zero_hold_redial(True)
+                accepted = await asyncio.to_thread(request_brokered_suspend, url)
+                lever = "brokered suspend"
+                if not accepted:
+                    self._scale_to_zero_hold_redial(False)  # nothing will freeze us
             if not accepted:
                 logger.warning(
-                    "scale-to-zero: self-suspend not accepted — machine stays "
-                    "awake (fail-awake); will retry on the next idle window"
+                    "scale-to-zero: %s not accepted — machine stays awake "
+                    "(fail-awake); will retry on the next idle window",
+                    lever,
                 )
         except Exception:  # noqa: BLE001 - suspend is best-effort, never crash
             logger.debug("scale-to-zero: self-suspend failed", exc_info=True)
+            self._scale_to_zero_hold_redial(False)
+
+    def _scale_to_zero_hold_redial(self, held: bool) -> None:
+        """Hold or release the relay's reconnect supervisor (brokered suspend).
+
+        Swallows everything: it must never block the suspend it precedes.
+        """
+        try:
+            adapter = self._relay_adapter_for_dormancy()
+            if adapter is None:
+                return
+            method = getattr(
+                adapter, "hold_redial" if held else "release_redial", None
+            )
+            if callable(method):
+                method()
+        except Exception:  # noqa: BLE001 - best-effort, never blocks the suspend
+            logger.debug("scale-to-zero: redial hold toggle failed", exc_info=True)
 
     def _status_action_label(self) -> str:
         return "restart" if self._restart_requested else "shutdown"
