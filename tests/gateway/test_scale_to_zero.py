@@ -230,6 +230,20 @@ class _FakeResponse:
         return False
 
 
+def test_brokered_timeout_outlasts_the_broker_and_fits_the_redial_hold():
+    """Cross-repo deadline chain. NAS's sleep route is hard-capped at
+    maxDuration = 30s; giving up sooner releases the redial hold while its stop is
+    still in flight, so the re-dial clears the flip and the stop lands on a live
+    destination. The hold ceiling must in turn outlast our wait.
+    """
+    from gateway.scale_to_zero import BROKERED_SUSPEND_TIMEOUT_S
+
+    NAS_ROUTE_MAX_DURATION_S = 30.0
+    REDIAL_HOLD_CEILING_S = 60.0  # ws_transport._redial_hold_max_s
+    assert NAS_ROUTE_MAX_DURATION_S < BROKERED_SUSPEND_TIMEOUT_S
+    assert BROKERED_SUSPEND_TIMEOUT_S < REDIAL_HOLD_CEILING_S
+
+
 def test_request_brokered_suspend_posts_the_signed_url():
     seen = {}
 

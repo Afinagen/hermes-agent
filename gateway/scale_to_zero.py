@@ -199,10 +199,16 @@ def suspend_available(environ: Optional[dict] = None) -> bool:
     return self_suspend_available(env) or brokered_sleep_url(env) is not None
 
 
+# Must EXCEED the broker's own hard request ceiling (NAS route maxDuration = 30s),
+# or we give up while it is still working: the redial hold would be released, the
+# re-dial would clear the flip, and its stop would then land on a live destination.
+BROKERED_SUSPEND_TIMEOUT_S = 40.0
+
+
 def request_brokered_suspend(
     url: str,
     *,
-    timeout: float = 10.0,
+    timeout: float = BROKERED_SUSPEND_TIMEOUT_S,
     opener: Any = None,
 ) -> bool:
     """POST the NAS sleep URL so NAS stops this machine on our behalf.
@@ -212,8 +218,8 @@ def request_brokered_suspend(
     import urllib.error
     import urllib.request
 
+    # urllib sets Content-Length itself for a bytes body.
     request = urllib.request.Request(url, data=b"", method="POST")
-    request.add_header("Content-Length", "0")
     open_url = opener or urllib.request.urlopen
     try:
         with open_url(request, timeout=timeout) as response:

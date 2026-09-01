@@ -9531,11 +9531,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._update_runtime_status("draining")
                 except Exception:  # noqa: BLE001 - status is best-effort
                     logger.debug("scale-to-zero: status mark failed", exc_info=True)
+                # Held BEFORE go_dormant, not after: its close arms the reconnect
+                # supervisor, and a re-dial clears the flip we are about to rely on.
+                # Released on every path that does not reach the suspend.
+                self._scale_to_zero_hold_redial(True)
                 dormant_ok = True
                 try:
                     result = go_dormant()
                     if asyncio.iscoroutine(result):
-                        await result
+                        result = await result
+                    # go_dormant returns the connector's going_idle ack. A missed ack
+                    # means inbound is NOT buffered yet, so suspending would freeze a
+                    # live destination: the dropped-message bug itself.
+                    if result is False:
+                        dormant_ok = False
+                        logger.warning(
+                            "scale-to-zero: connector did not ack going_idle — "
+                            "staying awake rather than freezing a live destination"
+                        )
                 except Exception:  # noqa: BLE001 - dormancy is best-effort
                     dormant_ok = False
                     logger.debug("scale-to-zero: go_dormant failed", exc_info=True)
@@ -9543,16 +9556,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # but give it a window so we don't immediately re-go-dormant on the
                 # same idle reading before traffic lands.
                 self._scale_to_zero_cooldown_until = time.time() + max(interval, 60.0)
-                # Self-suspend ONLY after a clean quiesce: the relay flip must be
-                # set (buffered delivery + wake poke armed) before the freeze, or
-                # inbound events black-hole while we sleep. Re-check idle one last
-                # time — inbound may have landed during the quiesce await.
+                # Suspend ONLY after an acked quiesce: the relay flip must be set
+                # before the freeze, or inbound black-holes while we sleep.
                 if not dormant_ok:
+                    self._scale_to_zero_hold_redial(False)
                     continue
+                # Inbound may have landed during the quiesce await.
                 if not self._scale_to_zero_is_idle():
                     logger.info(
                         "scale-to-zero: inbound arrived during quiesce — skipping suspend"
                     )
+                    self._scale_to_zero_hold_redial(False)
                     continue
                 await self._scale_to_zero_self_suspend()
             except asyncio.CancelledError:
@@ -9574,6 +9588,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             if self_suspend_available():
+                # Fly's suspend preserves RAM, so a hold left set would survive the
+                # resume and delay the re-dial the wake poke wants.
+                self._scale_to_zero_hold_redial(False)
                 accepted = await asyncio.to_thread(suspend_self)
                 lever = "self-suspend"
             else:
@@ -9586,9 +9603,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "without platform suspend"
                     )
                     return
-                # Park the supervisor: a re-dial would clear the dormant flip
-                # before the stop lands. Set before the first await.
-                self._scale_to_zero_hold_redial(True)
+                # The watcher already holds the supervisor across this call.
                 accepted = await asyncio.to_thread(request_brokered_suspend, url)
                 lever = "brokered suspend"
                 if not accepted:
