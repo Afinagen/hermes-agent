@@ -229,6 +229,41 @@ async def test_go_dormant_redials_on_wake_and_drains(server):
 
 
 @pytest.mark.asyncio
+async def test_adapter_redial_hold_delegates_to_transport(server):
+    """The runner only holds the adapter, so this delegation is the only thing
+    wiring its suspend decision to the transport. A silent no-op here would leave
+    the reconnect supervisor free to clear the dormant flip mid-suspend, with
+    every other test still passing."""
+    from gateway.config import PlatformConfig
+    from gateway.relay.adapter import RelayAdapter
+    from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
+
+    placeholder = CapabilityDescriptor(
+        contract_version=CONTRACT_VERSION,
+        platform="discord",
+        label="Relay",
+        max_message_length=4096,
+        supports_draft_streaming=False,
+        supports_edit=True,
+        supports_threads=False,
+        markdown_dialect="plain",
+        len_unit="chars",
+    )
+    transport = WebSocketRelayTransport(
+        server.url, "discord", "appShared", reconnect=True, reconnect_backoff_s=0.05
+    )
+    adapter = RelayAdapter(PlatformConfig(), placeholder, transport=transport)
+    await adapter.connect()
+    try:
+        adapter.hold_redial()
+        assert transport._redial_held is True
+        adapter.release_redial()
+        assert transport._redial_held is False
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_adapter_go_dormant_delegates_to_transport(server):
     """RelayAdapter.go_dormant() drives the transport's go_dormant (going_idle +
     dormant close) without the terminal teardown disconnect() does."""

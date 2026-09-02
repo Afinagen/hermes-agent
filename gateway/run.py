@@ -9598,6 +9598,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # stop verb and brokers it for us.
                 url = brokered_sleep_url()
                 if not url:
+                    # The watcher's hold must not outlive us: nothing is coming to
+                    # freeze the machine, so a held supervisor just stays offline.
+                    self._scale_to_zero_hold_redial(False)
                     logger.debug(
                         "scale-to-zero: no suspend lever available — dormant "
                         "without platform suspend"
@@ -9627,9 +9630,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = self._relay_adapter_for_dormancy()
             if adapter is None:
                 return
-            method = getattr(
-                adapter, "hold_redial" if held else "release_redial", None
-            )
+            method = getattr(adapter, "hold_redial" if held else "release_redial", None)
             if callable(method):
                 method()
         except Exception:  # noqa: BLE001 - best-effort, never blocks the suspend

@@ -184,6 +184,30 @@ async def test_watcher_holds_redial_before_going_dormant(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_watcher_releases_the_hold_when_inbound_arrives_mid_quiesce(monkeypatch):
+    """Idle at the top, busy by the time the quiesce returns: we abandon the
+    suspend, so the hold MUST go. Leaving it set strands the supervisor offline
+    for the whole hold ceiling at the exact moment inbound has arrived."""
+    r, adapter = _runner_with(monkeypatch, idle=True)
+    readings = iter([True, False])
+    monkeypatch.setattr(
+        r, "_scale_to_zero_is_idle", lambda: next(readings, False), raising=False
+    )
+    suspends = []
+    monkeypatch.setattr(
+        r, "_scale_to_zero_self_suspend", lambda: suspends.append(1) or _noop_async()
+    )
+
+    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
+    await asyncio.sleep(0.1)
+    r._running = False
+    await asyncio.wait_for(task, timeout=2)
+
+    assert suspends == []
+    assert adapter.redial == ["hold", "release"]
+
+
+@pytest.mark.asyncio
 async def test_watcher_does_not_suspend_when_the_connector_does_not_ack(monkeypatch):
     """go_dormant returns the going_idle ack. Without it inbound is not buffered,
     so freezing would drop it: stay awake and release the hold."""
@@ -397,20 +421,21 @@ async def test_watcher_skips_suspend_when_inbound_lands_mid_quiesce(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_self_suspend_noop_with_no_lever(monkeypatch):
-    """Neither an in-guest API nor a brokered URL: a silent no-op — dormancy
-    without platform suspend, never an error."""
-    r = GatewayRunner.__new__(GatewayRunner)
+    """Neither an in-guest API nor a brokered URL: a silent no-op, never an error.
+    The watcher's hold MUST be released — nothing is coming to freeze us, so a
+    supervisor left parked just sits offline until the hold ceiling."""
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
     monkeypatch.delenv("GATEWAY_RELAY_SLEEP_URL", raising=False)
-    monkeypatch.setattr(
-        "gateway.scale_to_zero.self_suspend_available", lambda *a, **k: False
-    )
     called = []
     monkeypatch.setattr(
         "gateway.scale_to_zero.suspend_self",
         lambda *a, **k: called.append(1) or True,
     )
+
     await r._scale_to_zero_self_suspend()
+
     assert called == []
+    assert adapter.redial == ["release"]
 
 
 # ── non-messaging platforms must not disarm (the api_server-key regression) ──
