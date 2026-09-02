@@ -227,16 +227,11 @@ async def test_go_dormant_redials_on_wake_and_drains(server):
     finally:
         await t.disconnect()
 
-
-def test_adapter_reports_false_when_the_transport_hold_fails():
-    """The runner suspends on the strength of this answer, so a transport that is
-    missing the method or throws must read as 'not held' rather than pass for
-    success on the mere absence of an exception."""
-    from gateway.config import PlatformConfig
-    from gateway.relay.adapter import RelayAdapter
+def _relay_descriptor():
+    """Placeholder descriptor for the adapter tests below."""
     from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 
-    placeholder = CapabilityDescriptor(
+    return CapabilityDescriptor(
         contract_version=CONTRACT_VERSION,
         platform="discord",
         label="Relay",
@@ -247,6 +242,17 @@ def test_adapter_reports_false_when_the_transport_hold_fails():
         markdown_dialect="plain",
         len_unit="chars",
     )
+
+
+
+def test_adapter_reports_false_when_the_transport_hold_fails():
+    """The runner suspends on the strength of this answer, so a transport that is
+    missing the method or throws must read as 'not held' rather than pass for
+    success on the mere absence of an exception."""
+    from gateway.config import PlatformConfig
+    from gateway.relay.adapter import RelayAdapter
+
+    placeholder = _relay_descriptor()
 
     class Throwing:
         def hold_redial(self):
@@ -287,19 +293,8 @@ async def test_adapter_redial_hold_delegates_to_transport(server):
     every other test still passing."""
     from gateway.config import PlatformConfig
     from gateway.relay.adapter import RelayAdapter
-    from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 
-    placeholder = CapabilityDescriptor(
-        contract_version=CONTRACT_VERSION,
-        platform="discord",
-        label="Relay",
-        max_message_length=4096,
-        supports_draft_streaming=False,
-        supports_edit=True,
-        supports_threads=False,
-        markdown_dialect="plain",
-        len_unit="chars",
-    )
+    placeholder = _relay_descriptor()
     transport = WebSocketRelayTransport(
         server.url, "discord", "appShared", reconnect=True, reconnect_backoff_s=0.05
     )
@@ -341,19 +336,8 @@ async def test_adapter_go_dormant_delegates_to_transport(server):
     dormant close) without the terminal teardown disconnect() does."""
     from gateway.config import PlatformConfig
     from gateway.relay.adapter import RelayAdapter
-    from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 
-    placeholder = CapabilityDescriptor(
-        contract_version=CONTRACT_VERSION,
-        platform="discord",
-        label="Relay",
-        max_message_length=4096,
-        supports_draft_streaming=False,
-        supports_edit=True,
-        supports_threads=False,
-        markdown_dialect="plain",
-        len_unit="chars",
-    )
+    placeholder = _relay_descriptor()
     transport = WebSocketRelayTransport(
         server.url, "discord", "appShared", reconnect=True, reconnect_backoff_s=0.05
     )

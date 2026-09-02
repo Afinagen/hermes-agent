@@ -9528,14 +9528,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._scale_to_zero_idle_timeout_seconds(),
                 )
                 self._scale_to_zero_mark_status("draining")
-                # Both levers need it. The 1s dormant re-dial can beat either a
-                # NAS round trip or Fly's local suspend, and a re-dial clears the
-                # flip the freeze depends on. Held BEFORE go_dormant, because its
-                # close is what arms that re-dial.
+                # Both levers: the 1s dormant re-dial can beat either suspend and
+                # clear the flip. Held BEFORE go_dormant, whose close arms it.
                 if not self._scale_to_zero_hold_redial(True):
-                    # The hold is the invariant, not a nicety: without it the
-                    # re-dial can clear the flip before the stop lands. Refuse
-                    # rather than quiesce into a suspend we cannot protect.
+                    # Without the hold the re-dial can clear the flip before the
+                    # stop lands, so refuse rather than suspend unprotected.
                     logger.warning(
                         "scale-to-zero: could not hold the relay re-dial — "
                         "staying awake rather than suspending unprotected"
@@ -9547,9 +9544,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result = go_dormant()
                     if asyncio.iscoroutine(result):
                         result = await result
-                    # go_dormant returns the connector's going_idle ack. A missed ack
-                    # means inbound is NOT buffered yet, so suspending would freeze a
-                    # live destination: the dropped-message bug itself.
+                    # The going_idle ack. Without it inbound is NOT buffered, so
+                    # suspending would freeze a live destination: the whole bug.
                     if result is not True:
                         dormant_ok = False
                         logger.warning(
@@ -9597,10 +9593,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self_suspend_available():
                 accepted = await asyncio.to_thread(suspend_self)
                 lever = "self-suspend"
-                # This call returns only after the freeze AND the later resume,
-                # so releasing here IS the post-resume release: the supervisor
-                # re-dials promptly instead of waiting out the ceiling. Nothing
-                # froze on a refusal, so that path un-quiesces us instead.
+                # Returns only after the freeze AND resume, so this IS the
+                # post-resume release: no waiting out the ceiling. A refusal froze
+                # nothing, so that path un-quiesces instead.
                 if accepted:
                     self._scale_to_zero_hold_redial(False)
                 else:

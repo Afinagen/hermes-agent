@@ -36,6 +36,14 @@ class _FakeRelayAdapter:
         return True
 
 
+async def _run_one_iteration(r, *, interval=0.01, settle=0.1):
+    """Run the watcher long enough for one iteration, then stop it cleanly."""
+    task = asyncio.create_task(r._scale_to_zero_watcher(interval=interval))
+    await asyncio.sleep(settle)
+    r._running = False
+    await asyncio.wait_for(task, timeout=2)
+
+
 async def _noop_async(*a, **k):
     return None
 
@@ -85,10 +93,7 @@ async def test_watcher_does_not_quiesce_when_no_suspend_lever_exists(
         raising=False,
     )
 
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r)
 
     assert adapter.go_dormant_calls == 0, "must not flip/close on a platform-timed suspend"
     assert suspends == []
@@ -114,10 +119,7 @@ async def test_watcher_quiesces_and_suspends_through_the_broker(monkeypatch):
 
     monkeypatch.setattr(r, "_scale_to_zero_self_suspend", fake_suspend, raising=False)
 
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.15)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r, settle=0.15)
 
     # Flip first, freeze second — the ordering the whole feature rests on.
     assert adapter.go_dormant_calls == 1
@@ -163,9 +165,9 @@ async def test_self_suspend_picks_a_lever_and_releases_only_when_nothing_will_fr
 
 @pytest.mark.asyncio
 async def test_watcher_honours_a_false_hold_from_the_adapter(monkeypatch):
-    """Exercises the real seam rather than a stubbed helper: the adapter never
-    raises, so the runner must read its RETURN value. An adapter reporting False
-    has to stop the quiesce just as a missing one does."""
+    """The hold is the invariant, not a nicety: quiescing without it leaves the
+    re-dial free to clear the flip mid-suspend. The adapter never raises, so the
+    runner must read its RETURN value, and a False must stop the quiesce."""
     r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
     monkeypatch.setenv(
         "GATEWAY_RELAY_SLEEP_URL",
@@ -177,38 +179,10 @@ async def test_watcher_honours_a_false_hold_from_the_adapter(monkeypatch):
         r, "_scale_to_zero_self_suspend", lambda: suspends.append(1) or _noop_async()
     )
 
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r)
 
     assert suspends == []
     assert adapter.go_dormant_calls == 0
-
-
-@pytest.mark.asyncio
-async def test_watcher_refuses_to_suspend_when_the_hold_cannot_be_installed(monkeypatch):
-    """The hold is the invariant, not a nicety. If the transport will not take it,
-    quiescing would leave the re-dial free to clear the flip mid-suspend, so stay
-    awake instead of suspending unprotected."""
-    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
-    monkeypatch.setenv(
-        "GATEWAY_RELAY_SLEEP_URL",
-        "https://portal.example.com/api/agents/i/sleep?t=s",
-    )
-    monkeypatch.setattr(r, "_scale_to_zero_hold_redial", lambda held: False)
-    suspends = []
-    monkeypatch.setattr(
-        r, "_scale_to_zero_self_suspend", lambda: suspends.append(1) or _noop_async()
-    )
-
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
-
-    assert suspends == []
-    assert adapter.go_dormant_calls == 0, "must not quiesce without the hold"
 
 
 @pytest.mark.asyncio
@@ -232,10 +206,7 @@ async def test_watcher_restores_running_when_it_abandons_the_suspend(monkeypatch
 
     adapter.go_dormant = unacked_go_dormant
 
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r)
 
     assert states[:2] == ["draining", "running"]
 
@@ -249,10 +220,7 @@ async def test_watcher_holds_redial_across_the_in_guest_suspend_too(monkeypatch)
     r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=True)
     monkeypatch.setattr("gateway.scale_to_zero.suspend_self", lambda *a, **k: True)
 
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r)
 
     assert adapter.go_dormant_calls >= 1
     assert adapter.redial == ["hold", "release"]
@@ -291,10 +259,7 @@ async def test_watcher_holds_redial_before_going_dormant(monkeypatch):
     )
     monkeypatch.setattr(r, "_scale_to_zero_self_suspend", _noop_async)
 
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r)
 
     assert order[:2] == ["hold=True", "go_dormant"]
 
@@ -318,10 +283,7 @@ async def test_watcher_releases_the_hold_when_inbound_arrives_mid_quiesce(monkey
         r, "_scale_to_zero_self_suspend", lambda: suspends.append(1) or _noop_async()
     )
 
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r)
 
     assert suspends == []
     assert adapter.redial == ["hold", "release"]
@@ -352,10 +314,7 @@ async def test_watcher_does_not_suspend_when_the_connector_does_not_ack(
         r, "_scale_to_zero_self_suspend", lambda: suspends.append(1) or _noop_async()
     )
 
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r)
 
     assert suspends == []
     assert adapter.redial[-1] == "release"
@@ -365,10 +324,7 @@ async def test_watcher_does_not_suspend_when_the_connector_does_not_ack(
 async def test_watcher_goes_dormant_when_idle(monkeypatch):
     r, adapter = _runner_with(monkeypatch, idle=True)
     # Run one iteration: stop after the first sleep so the loop exits cleanly.
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r)
     assert adapter.go_dormant_calls >= 1
     # After driving dormant, a re-arm cooldown is set (0.F).
     assert r._scale_to_zero_cooldown_until > time.time()
@@ -517,10 +473,7 @@ async def test_watcher_skips_suspend_when_dormant_fails(monkeypatch):
         suspend_calls.append(1)
 
     monkeypatch.setattr(r, "_scale_to_zero_self_suspend", fake_suspend, raising=False)
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r)
     # A failed quiesce means an UNFLIPPED relay — suspending would black-hole
     # inbound events. Must stay awake.
     assert suspend_calls == []
@@ -540,10 +493,7 @@ async def test_watcher_skips_suspend_when_inbound_lands_mid_quiesce(monkeypatch)
         suspend_calls.append(1)
 
     monkeypatch.setattr(r, "_scale_to_zero_self_suspend", fake_suspend, raising=False)
-    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.15)
-    r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await _run_one_iteration(r, settle=0.15)
     assert adapter.go_dormant_calls == 1
     assert suspend_calls == []
 
