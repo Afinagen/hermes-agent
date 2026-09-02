@@ -19,13 +19,14 @@ from gateway.run import GatewayRunner
 
 
 class _FakeRelayAdapter:
-    def __init__(self):
+    def __init__(self, ack=True):
         self.go_dormant_calls = 0
         self.redial = []
+        self.ack = ack
 
     async def go_dormant(self):
         self.go_dormant_calls += 1
-        return True
+        return self.ack
 
     def hold_redial(self):
         self.redial.append("hold")
@@ -48,7 +49,15 @@ async def _noop_async(*a, **k):
     return None
 
 
-def _runner_with(monkeypatch, *, idle, armed_adapter=True, can_self_suspend=True):
+def _runner_with(
+    monkeypatch,
+    *,
+    idle,
+    armed_adapter=True,
+    can_self_suspend=True,
+    brokered=False,
+    ack=True,
+):
     """Build a GatewayRunner without booting it, stubbing just what the watcher
     touches. Real methods (_scale_to_zero_is_idle composition, the watcher body)
     run; only their dependencies are stubbed.
@@ -65,12 +74,24 @@ def _runner_with(monkeypatch, *, idle, armed_adapter=True, can_self_suspend=True
     r._last_inbound_at = time.time()
     r._running_agents = {}
     r._background_tasks = set()
-    adapter = _FakeRelayAdapter() if armed_adapter else None
+    adapter = _FakeRelayAdapter(ack=ack) if armed_adapter else None
 
     monkeypatch.setattr(r, "_scale_to_zero_is_idle", lambda: idle, raising=False)
     monkeypatch.setattr(r, "_relay_adapter_for_dormancy", lambda: adapter, raising=False)
     monkeypatch.setattr(r, "_scale_to_zero_idle_timeout_seconds", lambda: 300.0, raising=False)
-    monkeypatch.setattr(r, "_update_runtime_status", lambda *a, **k: None, raising=False)
+    r.states = []
+    monkeypatch.setattr(
+        r,
+        "_update_runtime_status",
+        lambda *a, **k: r.states.append(a[0] if a else None),
+        raising=False,
+    )
+    if brokered:
+        can_self_suspend = False
+        monkeypatch.setenv(
+            "GATEWAY_RELAY_SLEEP_URL",
+            "https://portal.example.com/api/agents/i/sleep?t=s",
+        )
     monkeypatch.setattr(
         "gateway.scale_to_zero.self_suspend_available",
         lambda *a, **k: can_self_suspend,
@@ -168,11 +189,7 @@ async def test_watcher_honours_a_false_hold_from_the_adapter(monkeypatch):
     """The hold is the invariant, not a nicety: quiescing without it leaves the
     re-dial free to clear the flip mid-suspend. The adapter never raises, so the
     runner must read its RETURN value, and a False must stop the quiesce."""
-    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
-    monkeypatch.setenv(
-        "GATEWAY_RELAY_SLEEP_URL",
-        "https://portal.example.com/api/agents/i/sleep?t=s",
-    )
+    r, adapter = _runner_with(monkeypatch, idle=True, brokered=True)
     adapter.hold_redial = lambda: False
     suspends = []
     monkeypatch.setattr(
@@ -190,21 +207,12 @@ async def test_watcher_restores_running_when_it_abandons_the_suspend(monkeypatch
     """`draining` is only cleared by a real inbound event, so an abandoned attempt
     that leaves it set makes a quiet, awake, reconnected gateway advertise
     mid-shutdown indefinitely."""
-    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
-    monkeypatch.setenv(
-        "GATEWAY_RELAY_SLEEP_URL",
-        "https://portal.example.com/api/agents/i/sleep?t=s",
-    )
+    r, adapter = _runner_with(monkeypatch, idle=True, brokered=True)
     states = []
     monkeypatch.setattr(
         r, "_update_runtime_status", lambda *a, **k: states.append(a[0] if a else None)
     )
 
-    async def unacked_go_dormant():
-        adapter.go_dormant_calls += 1
-        return False
-
-    adapter.go_dormant = unacked_go_dormant
 
     await _run_one_iteration(r)
 
@@ -239,11 +247,7 @@ async def test_hold_redial_reports_failure_when_there_is_no_adapter(monkeypatch)
 async def test_watcher_holds_redial_before_going_dormant(monkeypatch):
     """The hold must precede go_dormant: its close arms the reconnect supervisor,
     and a re-dial would clear the flip the suspend depends on."""
-    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
-    monkeypatch.setenv(
-        "GATEWAY_RELAY_SLEEP_URL",
-        "https://portal.example.com/api/agents/i/sleep?t=s",
-    )
+    r, adapter = _runner_with(monkeypatch, idle=True, brokered=True)
     order = []
     original = adapter.go_dormant
 
@@ -269,11 +273,7 @@ async def test_watcher_releases_the_hold_when_inbound_arrives_mid_quiesce(monkey
     """Idle at the top, busy by the time the quiesce returns: we abandon the
     suspend, so the hold MUST go. Leaving it set strands the supervisor offline
     for the whole hold ceiling at the exact moment inbound has arrived."""
-    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
-    monkeypatch.setenv(
-        "GATEWAY_RELAY_SLEEP_URL",
-        "https://portal.example.com/api/agents/i/sleep?t=s",
-    )
+    r, adapter = _runner_with(monkeypatch, idle=True, brokered=True)
     readings = iter([True, False])
     monkeypatch.setattr(
         r, "_scale_to_zero_is_idle", lambda: next(readings, False), raising=False
@@ -296,19 +296,11 @@ async def test_watcher_does_not_suspend_when_the_connector_does_not_ack(
 ):
     """go_dormant returns the going_idle ack. Without it inbound is not buffered,
     so freezing would drop it: stay awake and release the hold."""
-    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
-    monkeypatch.setenv(
-        "GATEWAY_RELAY_SLEEP_URL",
-        "https://portal.example.com/api/agents/i/sleep?t=s",
+    # None as well as False: a partially-wired transport returning nothing has
+    # not acked either, and must not be read as one.
+    r, adapter = _runner_with(
+        monkeypatch, idle=True, brokered=True, ack=unacked_result
     )
-
-    # None as well as False: a stub or partially-wired transport that returns
-    # nothing has not acked either, and must not be read as one.
-    async def unacked_go_dormant():
-        adapter.go_dormant_calls += 1
-        return unacked_result
-
-    adapter.go_dormant = unacked_go_dormant
     suspends = []
     monkeypatch.setattr(
         r, "_scale_to_zero_self_suspend", lambda: suspends.append(1) or _noop_async()
