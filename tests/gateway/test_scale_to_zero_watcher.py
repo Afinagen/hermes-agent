@@ -29,9 +29,11 @@ class _FakeRelayAdapter:
 
     def hold_redial(self):
         self.redial.append("hold")
+        return True
 
     def release_redial(self):
         self.redial.append("release")
+        return True
 
 
 async def _noop_async(*a, **k):
@@ -126,9 +128,10 @@ async def test_watcher_quiesces_and_suspends_through_the_broker(monkeypatch):
 @pytest.mark.parametrize(
     "in_guest,accepted,lever,redial",
     [
-        # Fly is never held: the watcher holds only for the brokered lever, whose
-        # round trip the 1s dormant re-dial would otherwise beat.
-        (True, True, "flaps", []),
+        # Fly holds too: its local suspend can outlast the 1s dormant re-dial.
+        # suspend_self returns only after the freeze and resume, so releasing
+        # there is the post-resume release and costs no wake delay.
+        (True, True, "flaps", ["release"]),
         # Brokered + accepted: the watcher's hold stays, the stop is still in flight.
         (False, True, "brokered", []),
         # Brokered + refused: nothing will freeze us, so give the supervisor back.
@@ -156,6 +159,31 @@ async def test_self_suspend_picks_a_lever_and_releases_only_when_nothing_will_fr
 
     assert used == [lever]
     assert adapter.redial == redial
+
+
+@pytest.mark.asyncio
+async def test_watcher_honours_a_false_hold_from_the_adapter(monkeypatch):
+    """Exercises the real seam rather than a stubbed helper: the adapter never
+    raises, so the runner must read its RETURN value. An adapter reporting False
+    has to stop the quiesce just as a missing one does."""
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
+    monkeypatch.setenv(
+        "GATEWAY_RELAY_SLEEP_URL",
+        "https://portal.example.com/api/agents/i/sleep?t=s",
+    )
+    adapter.hold_redial = lambda: False
+    suspends = []
+    monkeypatch.setattr(
+        r, "_scale_to_zero_self_suspend", lambda: suspends.append(1) or _noop_async()
+    )
+
+    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
+    await asyncio.sleep(0.1)
+    r._running = False
+    await asyncio.wait_for(task, timeout=2)
+
+    assert suspends == []
+    assert adapter.go_dormant_calls == 0
 
 
 @pytest.mark.asyncio
@@ -213,14 +241,13 @@ async def test_watcher_restores_running_when_it_abandons_the_suspend(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_watcher_never_holds_redial_for_the_in_guest_lever(monkeypatch):
-    """Fly must not be held. Its suspend preserves RAM, so a hold set across the
-    freeze survives the resume and the supervisor then waits out the whole
-    ceiling before the re-dial the wake poke is waiting for."""
+async def test_watcher_holds_redial_across_the_in_guest_suspend_too(monkeypatch):
+    """Fly is held as well. Its local suspend request can outlast the 1s dormant
+    re-dial, and a re-dial that lands first clears the buffered flip before Fly
+    accepts the freeze. The release happens after suspend_self returns, which is
+    after the resume, so it costs no wake delay."""
     r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=True)
-    monkeypatch.setattr(
-        "gateway.scale_to_zero.suspend_self", lambda *a, **k: True
-    )
+    monkeypatch.setattr("gateway.scale_to_zero.suspend_self", lambda *a, **k: True)
 
     task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
     await asyncio.sleep(0.1)
@@ -228,7 +255,7 @@ async def test_watcher_never_holds_redial_for_the_in_guest_lever(monkeypatch):
     await asyncio.wait_for(task, timeout=2)
 
     assert adapter.go_dormant_calls >= 1
-    assert adapter.redial == []
+    assert adapter.redial == ["hold", "release"]
 
 
 @pytest.mark.asyncio

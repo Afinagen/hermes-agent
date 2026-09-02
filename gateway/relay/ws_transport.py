@@ -811,9 +811,9 @@ class WebSocketRelayTransport:
 
         On resume (process unfrozen) the supervisor's pending wait completes, the
         re-dial succeeds, and the connector drains the buffered backlog on the new
-        handshake. Returns the ``go_idle`` ack result (True on ack); the dormancy
-        close happens regardless (a missed ack at worst races one live event onto
-        a closing socket, exactly as §5.3 already tolerates).
+        handshake. Returns the ``go_idle`` ack result (True on ack), and on a
+        MISSED ack returns without closing: the caller refuses to suspend without
+        one, so closing would only cost a needless disconnect/reconnect cycle.
 
         No-op-safe: a transport that never connected (``_ws is None``) just
         returns False without closing.
@@ -821,6 +821,9 @@ class WebSocketRelayTransport:
         if self._ws is None:
             return False
         acked = await self.go_idle(timeout_s=timeout_s)
+        if not acked:
+            # Nothing will suspend us, so stay connected and keep serving.
+            return False
         # Mark dormant BEFORE closing so the supervisor (armed by the reader's
         # fall-through) takes the dormant cadence, and a racing live event can't
         # flip us back to a fast reconnect.
