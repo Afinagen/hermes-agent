@@ -246,9 +246,7 @@ def _relay_descriptor():
 
 
 def test_adapter_reports_false_when_the_transport_hold_fails():
-    """The runner suspends on the strength of this answer, so a transport that is
-    missing the method or throws must read as 'not held' rather than pass for
-    success on the mere absence of an exception."""
+    """The runner suspends on the strength of this answer, so a transport that is missing the method or throws must read as 'not held' rather than pass for success on the mere absence of an exception."""
     from gateway.config import PlatformConfig
     from gateway.relay.adapter import RelayAdapter
 
@@ -287,10 +285,7 @@ def test_adapter_reports_false_when_the_transport_hold_fails():
 
 @pytest.mark.asyncio
 async def test_adapter_redial_hold_delegates_to_transport(server):
-    """The runner only holds the adapter, so this delegation is the only thing
-    wiring its suspend decision to the transport. A silent no-op here would leave
-    the reconnect supervisor free to clear the dormant flip mid-suspend, with
-    every other test still passing."""
+    """The runner only holds the adapter, so this delegation is the…"""
     from gateway.config import PlatformConfig
     from gateway.relay.adapter import RelayAdapter
 
@@ -311,8 +306,7 @@ async def test_adapter_redial_hold_delegates_to_transport(server):
 
 @pytest.mark.asyncio
 async def test_go_dormant_leaves_the_socket_open_when_the_ack_is_missed(server):
-    """No ack means nothing will suspend us, so closing would only cost a
-    needless disconnect/reconnect cycle while the agent keeps serving."""
+    """No ack means nothing will suspend us, so closing would only cost a needless disconnect/reconnect cycle while the agent keeps serving."""
     t = WebSocketRelayTransport(
         server.url, "discord", "appShared", reconnect=True, reconnect_backoff_s=0.05
     )

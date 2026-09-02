@@ -207,9 +207,7 @@ def test_brokered_sleep_url_reads_the_stamp():
 
 
 def test_brokered_sleep_url_rejects_a_malformed_stamp(monkeypatch):
-    """Validated before it is treated as a lever: otherwise the watcher marks
-    draining, holds the re-dial and flips the connector, and only then does urllib
-    reject the value, quiescing for a suspend that could never happen."""
+    """Validated before it is treated as a lever: otherwise the watcher marks draining, holds the re-dial and flips the connector, and only then does urllib reject the value, quiescing for a suspend that could never happen."""
     from gateway.scale_to_zero import brokered_sleep_url
 
     for bad in ("not-a-url", "http://portal.example.com/x", "/api/agents/i/sleep"):
@@ -244,11 +242,7 @@ class _FakeResponse:
 
 
 def test_brokered_timeout_outlasts_the_broker_and_fits_the_redial_hold():
-    """Cross-repo deadline chain. NAS's sleep route is hard-capped at
-    maxDuration = 30s; giving up sooner releases the redial hold while its stop is
-    still in flight, so the re-dial clears the flip and the stop lands on a live
-    destination. The hold ceiling must in turn outlast our wait.
-    """
+    """Cross-repo deadline chain."""
     from gateway.relay.ws_transport import REDIAL_HOLD_MAX_S
     from gateway.scale_to_zero import BROKERED_SUSPEND_TIMEOUT_S
 
