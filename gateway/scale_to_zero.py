@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import socket
+import urllib.parse
 from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
@@ -184,10 +185,24 @@ def self_suspend_available(environ: Optional[dict] = None) -> bool:
 
 
 def brokered_sleep_url(environ: Optional[dict] = None) -> Optional[str]:
-    """The NAS sleep endpoint to POST, or None when this backend has no broker."""
+    """The NAS sleep endpoint to POST, or None when this backend has no broker.
+
+    Validated here rather than at POST time: a malformed value would otherwise let
+    the watcher mark draining, hold the re-dial and flip the connector before
+    urllib rejected it, quiescing for a suspend that could never happen.
+    """
     env = environ if environ is not None else os.environ
     url = str(env.get(SLEEP_URL_ENV, "")).strip()
-    return url or None
+    if not url:
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        logger.warning(
+            "scale-to-zero: ignoring malformed %s (want an absolute https URL)",
+            SLEEP_URL_ENV,
+        )
+        return None
+    return url
 
 
 def suspend_available(environ: Optional[dict] = None) -> bool:

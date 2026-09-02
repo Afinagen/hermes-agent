@@ -206,6 +206,19 @@ def test_brokered_sleep_url_reads_the_stamp():
     assert brokered_sleep_url({SLEEP_URL_ENV: "   "}) is None
 
 
+def test_brokered_sleep_url_rejects_a_malformed_stamp(monkeypatch):
+    """Validated before it is treated as a lever: otherwise the watcher marks
+    draining, holds the re-dial and flips the connector, and only then does urllib
+    reject the value, quiescing for a suspend that could never happen."""
+    from gateway.scale_to_zero import brokered_sleep_url
+
+    for bad in ("not-a-url", "http://portal.example.com/x", "/api/agents/i/sleep"):
+        monkeypatch.setenv("GATEWAY_RELAY_SLEEP_URL", bad)
+        assert brokered_sleep_url() is None, bad
+    monkeypatch.setenv("GATEWAY_RELAY_SLEEP_URL", "https://portal.example.com/x?t=s")
+    assert brokered_sleep_url() == "https://portal.example.com/x?t=s"
+
+
 def test_suspend_available_accepts_either_lever(monkeypatch):
     # No flaps socket but a broker exists, so the watcher may still quiesce.
     monkeypatch.setattr(
@@ -236,12 +249,12 @@ def test_brokered_timeout_outlasts_the_broker_and_fits_the_redial_hold():
     still in flight, so the re-dial clears the flip and the stop lands on a live
     destination. The hold ceiling must in turn outlast our wait.
     """
+    from gateway.relay.ws_transport import REDIAL_HOLD_MAX_S
     from gateway.scale_to_zero import BROKERED_SUSPEND_TIMEOUT_S
 
-    NAS_ROUTE_MAX_DURATION_S = 30.0
-    REDIAL_HOLD_CEILING_S = 60.0  # ws_transport._redial_hold_max_s
+    NAS_ROUTE_MAX_DURATION_S = 30.0  # mirrors the sleep route's maxDuration
     assert NAS_ROUTE_MAX_DURATION_S < BROKERED_SUSPEND_TIMEOUT_S
-    assert BROKERED_SUSPEND_TIMEOUT_S < REDIAL_HOLD_CEILING_S
+    assert BROKERED_SUSPEND_TIMEOUT_S < REDIAL_HOLD_MAX_S
 
 
 def test_request_brokered_suspend_posts_the_signed_url():

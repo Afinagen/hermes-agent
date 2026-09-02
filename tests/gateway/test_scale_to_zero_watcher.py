@@ -126,11 +126,12 @@ async def test_watcher_quiesces_and_suspends_through_the_broker(monkeypatch):
 @pytest.mark.parametrize(
     "in_guest,accepted,lever,redial",
     [
-        # Fly releases the watcher's hold: its suspend preserves RAM, so a hold left
-        # set would survive the resume and delay the re-dial the wake poke wants.
-        (True, True, "flaps", ["release"]),
-        # Brokered + accepted: the hold stays, because the stop is still in flight.
+        # Fly is never held: the watcher holds only for the brokered lever, whose
+        # round trip the 1s dormant re-dial would otherwise beat.
+        (True, True, "flaps", []),
+        # Brokered + accepted: the watcher's hold stays, the stop is still in flight.
         (False, True, "brokered", []),
+        # Brokered + refused: nothing will freeze us, so give the supervisor back.
         (False, False, "brokered", ["release"]),
     ],
 )
@@ -158,10 +159,96 @@ async def test_self_suspend_picks_a_lever_and_releases_only_when_nothing_will_fr
 
 
 @pytest.mark.asyncio
+async def test_watcher_refuses_to_suspend_when_the_hold_cannot_be_installed(monkeypatch):
+    """The hold is the invariant, not a nicety. If the transport will not take it,
+    quiescing would leave the re-dial free to clear the flip mid-suspend, so stay
+    awake instead of suspending unprotected."""
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
+    monkeypatch.setenv(
+        "GATEWAY_RELAY_SLEEP_URL",
+        "https://portal.example.com/api/agents/i/sleep?t=s",
+    )
+    monkeypatch.setattr(r, "_scale_to_zero_hold_redial", lambda held: False)
+    suspends = []
+    monkeypatch.setattr(
+        r, "_scale_to_zero_self_suspend", lambda: suspends.append(1) or _noop_async()
+    )
+
+    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
+    await asyncio.sleep(0.1)
+    r._running = False
+    await asyncio.wait_for(task, timeout=2)
+
+    assert suspends == []
+    assert adapter.go_dormant_calls == 0, "must not quiesce without the hold"
+
+
+@pytest.mark.asyncio
+async def test_watcher_restores_running_when_it_abandons_the_suspend(monkeypatch):
+    """`draining` is only cleared by a real inbound event, so an abandoned attempt
+    that leaves it set makes a quiet, awake, reconnected gateway advertise
+    mid-shutdown indefinitely."""
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
+    monkeypatch.setenv(
+        "GATEWAY_RELAY_SLEEP_URL",
+        "https://portal.example.com/api/agents/i/sleep?t=s",
+    )
+    states = []
+    monkeypatch.setattr(
+        r, "_update_runtime_status", lambda *a, **k: states.append(a[0] if a else None)
+    )
+
+    async def unacked_go_dormant():
+        adapter.go_dormant_calls += 1
+        return False
+
+    adapter.go_dormant = unacked_go_dormant
+
+    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
+    await asyncio.sleep(0.1)
+    r._running = False
+    await asyncio.wait_for(task, timeout=2)
+
+    assert states[:2] == ["draining", "running"]
+
+
+@pytest.mark.asyncio
+async def test_watcher_never_holds_redial_for_the_in_guest_lever(monkeypatch):
+    """Fly must not be held. Its suspend preserves RAM, so a hold set across the
+    freeze survives the resume and the supervisor then waits out the whole
+    ceiling before the re-dial the wake poke is waiting for."""
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=True)
+    monkeypatch.setattr(
+        "gateway.scale_to_zero.suspend_self", lambda *a, **k: True
+    )
+
+    task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
+    await asyncio.sleep(0.1)
+    r._running = False
+    await asyncio.wait_for(task, timeout=2)
+
+    assert adapter.go_dormant_calls >= 1
+    assert adapter.redial == []
+
+
+@pytest.mark.asyncio
+async def test_hold_redial_reports_failure_when_there_is_no_adapter(monkeypatch):
+    """The return value gates the suspend, so an absent adapter must read as
+    'not held' rather than silently as success."""
+    r, _ = _runner_with(monkeypatch, idle=True, armed_adapter=False)
+
+    assert r._scale_to_zero_hold_redial(True) is False
+
+
+@pytest.mark.asyncio
 async def test_watcher_holds_redial_before_going_dormant(monkeypatch):
     """The hold must precede go_dormant: its close arms the reconnect supervisor,
     and a re-dial would clear the flip the suspend depends on."""
-    r, adapter = _runner_with(monkeypatch, idle=True)
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
+    monkeypatch.setenv(
+        "GATEWAY_RELAY_SLEEP_URL",
+        "https://portal.example.com/api/agents/i/sleep?t=s",
+    )
     order = []
     original = adapter.go_dormant
 
@@ -171,7 +258,9 @@ async def test_watcher_holds_redial_before_going_dormant(monkeypatch):
 
     adapter.go_dormant = recording_go_dormant
     monkeypatch.setattr(
-        r, "_scale_to_zero_hold_redial", lambda held: order.append(f"hold={held}")
+        r,
+        "_scale_to_zero_hold_redial",
+        lambda held: bool(order.append(f"hold={held}")) or True,
     )
     monkeypatch.setattr(r, "_scale_to_zero_self_suspend", _noop_async)
 
@@ -188,7 +277,11 @@ async def test_watcher_releases_the_hold_when_inbound_arrives_mid_quiesce(monkey
     """Idle at the top, busy by the time the quiesce returns: we abandon the
     suspend, so the hold MUST go. Leaving it set strands the supervisor offline
     for the whole hold ceiling at the exact moment inbound has arrived."""
-    r, adapter = _runner_with(monkeypatch, idle=True)
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
+    monkeypatch.setenv(
+        "GATEWAY_RELAY_SLEEP_URL",
+        "https://portal.example.com/api/agents/i/sleep?t=s",
+    )
     readings = iter([True, False])
     monkeypatch.setattr(
         r, "_scale_to_zero_is_idle", lambda: next(readings, False), raising=False
@@ -208,14 +301,23 @@ async def test_watcher_releases_the_hold_when_inbound_arrives_mid_quiesce(monkey
 
 
 @pytest.mark.asyncio
-async def test_watcher_does_not_suspend_when_the_connector_does_not_ack(monkeypatch):
+@pytest.mark.parametrize("unacked_result", [False, None])
+async def test_watcher_does_not_suspend_when_the_connector_does_not_ack(
+    monkeypatch, unacked_result
+):
     """go_dormant returns the going_idle ack. Without it inbound is not buffered,
     so freezing would drop it: stay awake and release the hold."""
-    r, adapter = _runner_with(monkeypatch, idle=True)
+    r, adapter = _runner_with(monkeypatch, idle=True, can_self_suspend=False)
+    monkeypatch.setenv(
+        "GATEWAY_RELAY_SLEEP_URL",
+        "https://portal.example.com/api/agents/i/sleep?t=s",
+    )
 
+    # None as well as False: a stub or partially-wired transport that returns
+    # nothing has not acked either, and must not be read as one.
     async def unacked_go_dormant():
         adapter.go_dormant_calls += 1
-        return False
+        return unacked_result
 
     adapter.go_dormant = unacked_go_dormant
     suspends = []

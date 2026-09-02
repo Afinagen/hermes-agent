@@ -434,6 +434,12 @@ def _passthrough_from_wire(raw: Dict[str, Any]) -> PassthroughForward:
     )
 
 
+# Ceiling on the brokered-suspend redial hold. Must outlast the client's own
+# broker deadline (scale_to_zero.BROKERED_SUSPEND_TIMEOUT_S) or the supervisor
+# reconnects while the stop is still in flight.
+REDIAL_HOLD_MAX_S = 60.0
+
+
 class WebSocketRelayTransport:
     """RelayTransport over a WebSocket connection the gateway dials to the connector."""
 
@@ -511,7 +517,7 @@ class WebSocketRelayTransport:
         self._redial_held = False
         self._redial_release = asyncio.Event()
         # Ceiling, so a suspend that never lands cannot strand us offline.
-        self._redial_hold_max_s = 60.0
+        self._redial_hold_max_s = REDIAL_HOLD_MAX_S
 
         self._ws: Any = None
         self._reader: Optional[asyncio.Task[None]] = None

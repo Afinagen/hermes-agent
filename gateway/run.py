@@ -9511,7 +9511,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 # Quiesce only when a suspend can follow it: otherwise the
                 # re-dial after the socket close just clears the flip again.
-                from gateway.scale_to_zero import suspend_available
+                from gateway.scale_to_zero import (
+                    brokered_sleep_url,
+                    self_suspend_available,
+                    suspend_available,
+                )
 
                 if not suspend_available():
                     if not self._scale_to_zero_no_suspend_logged:
@@ -9527,14 +9531,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "(relay buffered, socket closed) then self-suspending",
                     self._scale_to_zero_idle_timeout_seconds(),
                 )
-                try:
-                    self._update_runtime_status("draining")
-                except Exception:  # noqa: BLE001 - status is best-effort
-                    logger.debug("scale-to-zero: status mark failed", exc_info=True)
-                # Held BEFORE go_dormant, not after: its close arms the reconnect
-                # supervisor, and a re-dial clears the flip we are about to rely on.
-                # Released on every path that does not reach the suspend.
-                self._scale_to_zero_hold_redial(True)
+                self._scale_to_zero_mark_status("draining")
+                # Only the brokered lever needs the hold: Fly's suspend is a local
+                # socket call that freezes us in-place, while NAS's is a round trip
+                # the 1s dormant re-dial would beat, clearing the flip mid-suspend.
+                # Held BEFORE go_dormant because its close is what arms that re-dial.
+                holds_redial = not self_suspend_available() and (
+                    brokered_sleep_url() is not None
+                )
+                if holds_redial and not self._scale_to_zero_hold_redial(True):
+                    # The hold is the invariant, not a nicety: without it the
+                    # re-dial can clear the flip before the stop lands. Refuse
+                    # rather than quiesce into a suspend we cannot protect.
+                    logger.warning(
+                        "scale-to-zero: could not hold the relay re-dial — "
+                        "staying awake rather than suspending unprotected"
+                    )
+                    self._scale_to_zero_abandon_suspend(False)
+                    continue
                 dormant_ok = True
                 try:
                     result = go_dormant()
@@ -9543,7 +9557,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # go_dormant returns the connector's going_idle ack. A missed ack
                     # means inbound is NOT buffered yet, so suspending would freeze a
                     # live destination: the dropped-message bug itself.
-                    if result is False:
+                    if result is not True:
                         dormant_ok = False
                         logger.warning(
                             "scale-to-zero: connector did not ack going_idle — "
@@ -9559,14 +9573,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Suspend ONLY after an acked quiesce: the relay flip must be set
                 # before the freeze, or inbound black-holes while we sleep.
                 if not dormant_ok:
-                    self._scale_to_zero_hold_redial(False)
+                    self._scale_to_zero_abandon_suspend(holds_redial)
                     continue
                 # Inbound may have landed during the quiesce await.
                 if not self._scale_to_zero_is_idle():
                     logger.info(
                         "scale-to-zero: inbound arrived during quiesce — skipping suspend"
                     )
-                    self._scale_to_zero_hold_redial(False)
+                    self._scale_to_zero_abandon_suspend(holds_redial)
                     continue
                 await self._scale_to_zero_self_suspend()
             except asyncio.CancelledError:
@@ -9588,9 +9602,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             if self_suspend_available():
-                # Fly's suspend preserves RAM, so a hold left set would survive the
-                # resume and delay the re-dial the wake poke wants.
-                self._scale_to_zero_hold_redial(False)
                 accepted = await asyncio.to_thread(suspend_self)
                 lever = "self-suspend"
             else:
@@ -9598,9 +9609,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # stop verb and brokers it for us.
                 url = brokered_sleep_url()
                 if not url:
-                    # The watcher's hold must not outlive us: nothing is coming to
-                    # freeze the machine, so a held supervisor just stays offline.
-                    self._scale_to_zero_hold_redial(False)
+                    # The watcher held on our behalf; nothing is coming to freeze
+                    # the machine, so a held supervisor would just stay offline.
+                    self._scale_to_zero_abandon_suspend(True)
                     logger.debug(
                         "scale-to-zero: no suspend lever available — dormant "
                         "without platform suspend"
@@ -9610,7 +9621,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 accepted = await asyncio.to_thread(request_brokered_suspend, url)
                 lever = "brokered suspend"
                 if not accepted:
-                    self._scale_to_zero_hold_redial(False)  # nothing will freeze us
+                    self._scale_to_zero_abandon_suspend(True)
             if not accepted:
                 logger.warning(
                     "scale-to-zero: %s not accepted — machine stays awake "
@@ -9619,22 +9630,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         except Exception:  # noqa: BLE001 - suspend is best-effort, never crash
             logger.debug("scale-to-zero: self-suspend failed", exc_info=True)
-            self._scale_to_zero_hold_redial(False)
+            self._scale_to_zero_abandon_suspend(True)
 
-    def _scale_to_zero_hold_redial(self, held: bool) -> None:
-        """Hold or release the relay's reconnect supervisor (brokered suspend).
+    def _scale_to_zero_mark_status(self, state: str) -> None:
+        try:
+            self._update_runtime_status(state)
+        except Exception:  # noqa: BLE001 - status is best-effort
+            logger.debug("scale-to-zero: status mark failed", exc_info=True)
 
-        Swallows everything: it must never block the suspend it precedes.
+    def _scale_to_zero_abandon_suspend(self, holds_redial: bool) -> None:
+        """Undo a quiesce we are not going to follow with a suspend.
+
+        Both halves together: a released supervisor that still advertises
+        `draining` reads as mid-shutdown forever, since only a real inbound event
+        restores `running`.
         """
+        if holds_redial:
+            self._scale_to_zero_hold_redial(False)
+        self._scale_to_zero_mark_status("running")
+
+    def _scale_to_zero_hold_redial(self, held: bool) -> bool:
+        """Hold or release the relay's reconnect supervisor. Returns whether the
+        transport actually took it, so the caller can refuse to suspend without
+        the protection rather than fail open on it."""
         try:
             adapter = self._relay_adapter_for_dormancy()
             if adapter is None:
-                return
+                return False
             method = getattr(adapter, "hold_redial" if held else "release_redial", None)
-            if callable(method):
-                method()
-        except Exception:  # noqa: BLE001 - best-effort, never blocks the suspend
+            if not callable(method):
+                return False
+            method()
+            return True
+        except Exception:  # noqa: BLE001 - never blocks the suspend it precedes
             logger.debug("scale-to-zero: redial hold toggle failed", exc_info=True)
+            return False
 
     def _status_action_label(self) -> str:
         return "restart" if self._restart_requested else "shutdown"
