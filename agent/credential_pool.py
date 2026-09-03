@@ -9,6 +9,8 @@ import threading
 import time
 import uuid
 import re
+import hashlib
+import json
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +42,12 @@ from hermes_cli.auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _credential_rows_fingerprint(rows: List[Dict[str, Any]]) -> str:
+    """Return a stable, non-logged fingerprint for one persisted provider slice."""
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _load_config_safe() -> Optional[dict]:
@@ -580,13 +588,24 @@ def _write_through_provider_state_to_global_root(
 
 
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(
+        self,
+        provider: str,
+        entries: List[PooledCredential],
+        *,
+        persisted_rows: Optional[List[Dict[str, Any]]] = None,
+    ):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
         self._lock = threading.Lock()
         self._active_leases: Dict[str, int] = {}
+        self._persisted_fingerprint = (
+            _credential_rows_fingerprint(persisted_rows)
+            if persisted_rows is not None
+            else None
+        )
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
         # Monotonic timestamp of the last "no available entries" log, used to
         # throttle that message so an empty/exhausted pool cannot storm the
@@ -660,11 +679,37 @@ class CredentialPool:
                 return
 
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+        rows = [entry.to_dict() for entry in self._entries]
         write_credential_pool(
             self.provider,
-            [entry.to_dict() for entry in self._entries],
+            rows,
             removed_ids=removed_ids,
         )
+        self._persisted_fingerprint = _credential_rows_fingerprint(rows)
+
+    def _reload_from_auth_store_if_idle_unlocked(self) -> bool:
+        """Adopt another process's persisted pool change before a new request."""
+        if self._persisted_fingerprint is None or any(
+            count > 0 for count in self._active_leases.values()
+        ):
+            return False
+        try:
+            with _auth_store_lock():
+                raw_rows = read_credential_pool(self.provider)
+        except Exception as exc:
+            logger.debug("credential pool: live reload skipped (%s)", type(exc).__name__)
+            return False
+        rows = [row for row in raw_rows if isinstance(row, dict)]
+        fingerprint = _credential_rows_fingerprint(rows)
+        if fingerprint == self._persisted_fingerprint:
+            return False
+        self._entries = sorted(
+            [PooledCredential.from_dict(self.provider, row) for row in rows],
+            key=lambda entry: entry.priority,
+        )
+        self._current_id = None
+        self._persisted_fingerprint = fingerprint
+        return True
 
     def _is_terminal_auth_failure(
         self,
@@ -1592,6 +1637,7 @@ class CredentialPool:
 
     def select(self) -> Optional[PooledCredential]:
         with self._lock:
+            self._reload_from_auth_store_if_idle_unlocked()
             entry = self._select_unlocked()
             if entry is not None:
                 # A normal (non-recovery) selection starts a fresh episode —
@@ -1937,6 +1983,7 @@ class CredentialPool:
                 self._current_id = credential_id
                 return credential_id
 
+            self._reload_from_auth_store_if_idle_unlocked()
             available = self._available_entries(clear_expired=True, refresh=True)
             if not available:
                 return None
@@ -2803,4 +2850,8 @@ def load_pool(provider: str) -> CredentialPool:
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
         )
-    return CredentialPool(provider, entries)
+    return CredentialPool(
+        provider,
+        entries,
+        persisted_rows=[entry.to_dict() for entry in entries],
+    )
